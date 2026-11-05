@@ -47,7 +47,7 @@ try {
   assert.ok((await getProject()).panels.every(p => !p.image && !p.dialogue && !p.alt));
   assert.equal((await owner.get()).body.projects.length, 1);
   assert.equal((await accounts[1].get()).body.projects.length, 0);
-  await mutate(owner, "review", {}, 400);
+  await mutate(owner, "review", {}, 403);
   console.log("PASS empty account workspaces, no sample content, saved genre, and incomplete draft gate");
   assert.equal((await outsider.get()).body.projects.length, 0);
   await outsider.post({ action: "save", id }, 401);
@@ -94,33 +94,15 @@ try {
   await Promise.all([owner.post({ action: "save", id, revision: beforeConcurrent.revision, ...payload }), new Promise(resolve => setTimeout(resolve, 50)).then(() => accounts[1].post({ action: "save", id, revision: beforeConcurrent.revision, ...payload }, 409))]);
   console.log("PASS persistence, exact integer shares, and stale/concurrent edit protection");
 
-  await mutate(owner, "save", { ...payload, members: payload.members.map(m => ({ ...m, share: 2400 })) });
-  await mutate(owner, "review", {}, 400);
-  await mutate(owner, "save", payload);
-  await mutate(owner, "review");
-  await mutate(owner, "publish", {}, 403);
-  await mutate(owner, "save", payload, 409);
-  await owner.post({ action: "invite", id, email: "late@example.test" }, 403);
-  await mutate(accounts[0], "approve"); await mutate(accounts[1], "approve");
-  await mutate(accounts[1], "revoke");
-  assert.equal((await getProject()).approvals.length, 1);
-  await mutate(owner, "revise");
-  assert.deepEqual((await getProject()).approvals, []);
-  await mutate(owner, "review");
-  assert.equal((await getProject()).version, 2);
-  for (const account of accounts) await mutate(account, "approve");
-  await mutate(accounts[1], "publish", {}, 403);
-  await mutate(owner, "publish");
-  assert.equal((await outsider.get()).body.comics.find(p => p.id === id).state, "published");
-  await mutate(owner, "save", payload, 409);
-  await mutate(owner, "publish", {}, 409);
-  assert.equal((await fetch(base + `/comics/${id}`)).status, 200);
-  console.log("PASS freeze, revocation, revision invalidation, unanimous publish gate, and immutable reader page");
-
+  for (const action of ["approve", "revoke", "publish"]) await mutate(owner, action, {}, 403);
+  await mutate(owner, "review", { publicationConsent: true }, 403);
+  assert.equal((await getProject()).state, "draft");
+  assert.equal((await outsider.get()).body.comics.length, 0);
+  console.log("PASS server-only consent and publication disabled; signed-in wallet required for review");
   const saved = JSON.parse(await readFile(path.join(process.cwd(), ".data", namespace, "studio.json"), "utf8"));
   assert.ok(saved.users.every(u => u.password !== "prototype-test-password" && u.password.length === 128));
   await stop(); await start();
-  assert.equal((await getProject()).state, "published");
+  assert.equal((await getProject()).state, "draft");
   await owner.post({ action: "logout" }); assert.equal((await owner.get()).body.user, null);
   await owner.post({ action: "login", email: "creator0@example.test", password: "wrong-password" }, 401);
   await owner.post({ action: "login", email: "creator0@example.test", password: "prototype-test-password" });

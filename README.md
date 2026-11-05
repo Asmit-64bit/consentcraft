@@ -1,79 +1,92 @@
 # ConsentCraft
 
-A working local prototype of a collaborative comic studio, with a neobrutalist interface, flexible teams, private drafts, explicit version approvals, and dedicated public comic pages.
+A collaborative comic studio with Solidity-enforced consent, ERC-721 collectibles, a fixed-price primary sale, and contributor withdrawals. The interface uses neobrutalism, teams are dynamic, and every minted comic has a dedicated reader page. New accounts and the library start empty.
 
-## Run
+## Run the complete local Web3 app
 
-Use Node.js 24 and the committed npm lockfile.
+Use Node.js 24 and the committed npm lockfile. The repository `.npmrc` preserves the wallet stack's peer-resolution settings; required SIWE and Hardhat peers are explicit dependencies.
 
 ```sh
 npm ci
+npm run contracts:compile
+```
+
+Start the local Ethereum node in one terminal:
+
+```sh
+npm run chain
+```
+
+In another terminal:
+
+```sh
+npm run deploy:local
 npm run dev
 ```
 
-Open http://localhost:3000 and choose **Create your studio**. Sign up with an email and password or connect your Ethereum wallet. Every account starts empty: create a project, upload your own artwork, and invite your collaborators. Only comics published by users appear in the library.
+Open http://127.0.0.1:3000 and check **Ethereum** in the sidebar. The app reads the deployed address from `deployments/local.json`. The RPC is `http://127.0.0.1:8545`, chain ID `31337`. Local Hardhat wallets are disposable development accounts; never fund them on a public network. The node's logs are in `.data/local-chain.log`. Connect a development wallet using your wallet extension.
+
+## Complete workflow
+
+1. Create an account or sign in with your wallet. Email accounts can draft, but every contributor must link a wallet before review.
+2. Create a project, upload four PNG/JPEG panels, and add image descriptions and optional dialogue.
+3. Invite contributors by wallet or email. Recipients accept from **Invitations** or the shared link. The app does not send email.
+4. Set roles, positive shares totaling 100%, exact test ETH price, and artwork use terms. The last listed contributor receives any wei rounding remainder.
+5. Save. In **Review & publish**, consent to exposing the immutable review package and prepare it. Review the package links, then propose the version through your wallet.
+6. Every contributor reviews and approves the same onchain version. The owner cannot mint with missing consent. Revoke approval before editing; a newly proposed version invalidates old approvals.
+7. Once everyone agrees, the owner mints the ERC-721 into contract escrow. Its price, package, and shares cannot change after minting. There is no delisting or refund.
+8. A collector opens the public comic page, reviews terms and gas, and buys for the exact test ETH price. The contract transfers the NFT and allocates proceeds.
+9. Each creator opens **Earnings** and withdraws their allocation to their chosen wallet. A failed withdrawal does not block anyone else.
+
+Every wallet action simulates before submission. Submitted hashes persist immediately in the browser, project transactions are recorded by the server, and completion waits for two confirmations. Refresh reconciles contract state. Keep pending hashes when an RPC is unavailable; never infer success from a button click.
+
+## Test
 
 ```sh
+npm run build
 npm run lint
 npm run typecheck
-npm run build
+npm run contracts:test
 npm test
-npm start
+npm run test:web3
 ```
 
-The integration test starts its own production server on port 3017, uses an isolated `.data/test-<uuid>` namespace, and stops that server on completion. Run the build before the test. The normal studio is never modified by integration tests.
+The build compiles Solidity and regenerates `lib/contracts/abi.ts` before building Next.js. Contract artifacts are generated in `artifacts/`.
 
-## Working features
+Contract tests use their own Hardhat node on port 8546. App tests use a production server on 3017. Full Web3 tests use ports 8547 and 3019, isolated `.data/web3-test-<uuid>` storage, four contributor wallets, and a separate collector. They exercise proposals, revision invalidation, minting, the sale, accounting, withdrawals, and immutable content hashes without touching the normal studio or its chain.
 
-- Local account creation, password sign-in, hashed passwords, expiring HttpOnly session cookies, and sign-out.
-- Optional Ethereum wallet sign-in using RainbowKit and SIWE, including domain checks, expiring nonces, signature verification, and replay rejection.
-- Per-user dashboards, persistent project creation, search, and state filters.
-- Teams with a variable number of contributors. Invitations target an email or wallet address, appear in the recipient’s Invitations page, expire after seven days, can be canceled, and can only be accepted once by the matching account. Duplicate active invitations are rejected.
-- Four-panel editing with PNG/JPEG uploads, server-side image decoding and normalization, dialogue, image descriptions, ordering, preview, explicit save, and stale-revision rejection. The first uploaded panel supplies the cover; there is no sample-art fallback.
-- Editable contributor roles, integer basis-point shares, and use terms.
-- Review freezes a version and its team. Each member approves or revokes independently. Reopening the draft invalidates all approvals.
-- Publication requires unanimous approval. Published comics have their own `/comics/[id]` reader page, credits, terms, sharing, and panel-by-panel reading.
-- Searchable public comic library and project activity history.
-- Responsive desktop/mobile layouts and keyboard-accessible native dialogs.
+## Ethereum Sepolia and IPFS
 
-## Try collaboration
+The Solidity contract is deployable to Sepolia. In a **deployment-only shell**, supply `SEPOLIA_RPC_URL` and a `DEPLOYER_PRIVATE_KEY` funded with Sepolia test ETH, then run:
 
-1. Create a normal account and a project.
-2. In **Team & shares**, create an invitation for another person's email or wallet and copy its link. The app does not send email.
-3. The collaborator signs in with the invited identity and opens **Invitations**, or opens the shared link in a separate browser profile, then accepts.
-4. Add more collaborators as needed. The owner sets positive shares totaling 100%.
-5. Upload four panels and add image descriptions. Save, then freeze the version under **Review & publish**.
-6. Each contributor signs in and approves. Use **Refresh** to load another contributor's latest action.
-7. The owner publishes once every contributor has approved. Share the comic's reader URL.
+```sh
+npm run contracts:compile
+npm run deploy:sepolia
+```
 
-## Wallet configuration
+The script checks the chain ID, waits for two confirmations, and writes `deployments/sepolia.json`. It never deploys to mainnet. Do not place a deployer key in a web app environment file or browser setting.
 
-Browser-injected wallets work without WalletConnect configuration. To enable the full WalletConnect wallet list, set your own `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` in `.env.local` and restart. No third-party project ID is embedded in the code. Never put a private key or seed phrase in this application.
+Configure the web server using `.env.example`: `NEXT_PUBLIC_CHAIN_ID=11155111`, the deployed `NEXT_PUBLIC_CONSENTCRAFT_ADDRESS`, `EVM_RPC_URL`, a public `NEXT_PUBLIC_APP_URL`, and server-only `PINATA_JWT`. Rebuild after changing public variables. Sepolia package preparation refuses to use local file URLs: IPFS pinning must be configured. WalletConnect is optional; injected wallets work without a project ID.
 
-The automated tests use freshly generated disposable signing keys to test SIWE. A real browser-extension wallet signature still requires the user to complete that wallet's own approval screen.
+No Sepolia deployment or live IPFS upload has been performed without the user's credentials and funded signer. Current implementation and verification boundaries are recorded in `IMPLEMENTATION_STATUS.md`.
 
-## Storage and boundaries
+## Data and integrity
 
-Data lives in `.data/studio/studio.json` on the server machine. Uploaded artwork is resized by the browser, fully decoded and normalized on the server, stripped of metadata, and stored as image data in this file. Invalid image data, SVG sample paths, and images over 20 megapixels are rejected. The `.data` directory is ignored by Git. Back up that directory to preserve the workspace; it contains account hashes, sessions, private drafts, and uploaded artwork.
+Drafts, sessions, and account hashes live in `.data/studio/studio.json`. Files prepared for review are stored by SHA-256 under `.data/studio/content`, served through an immutable endpoint, and bound to the contract by Keccak-256 hashes of the actual bytes. JSON uses recursively sorted keys and UTF-8 encoding. IPFS mode pins those same bytes and retains a local backup. Metadata contains approved wallet credits, not account emails.
 
-Upgrading from the sample-filled version archives its example comics and anonymous demo-account projects in `archivedDemoProjects` inside the same JSON file. Demo sessions are signed out. The archive preserves edits for manual recovery; it is not exposed through the API. Regular accounts and their projects stay active. New databases never seed demo content.
+The published reader uses the frozen snapshot after a confirmed mint. The contract is authoritative for consent, versions, escrow ownership, sale state, and balances. The file store is for a single Node process; it is not a multi-process/serverless database. Back up `.data`. Email accounts do not verify email ownership or provide password recovery; wallet verification is required for the onchain workflow.
 
-This is designed for one local Node server, with serialized file transactions and atomic file replacement. It is not a multi-process or serverless database. Different people must access the same running server to collaborate; a localhost URL on another computer refers to that person's own computer.
+Old seeded examples and anonymous demo work are preserved in `archivedDemoProjects`, outside active workspaces and the public API. Regular accounts remain active. No sample comics, artificial approvals, fake receipts, or simulated earnings appear in the product.
 
-Local email accounts do not verify email ownership or support password recovery. Production use needs verified identity, rate limiting, CSRF/session hardening appropriate to the deployment, a durable database with migrations and access policies, object storage, operational monitoring, and a security review.
+## Code
 
-Wallet sign-in is authentication only. Approvals are recorded by the application. This prototype does not deploy a smart contract, mint NFTs, sell collectibles, distribute payments, pin IPFS content, or enforce copyright. Shares record the team's agreement; no earnings are simulated. Publication exposes the comic to anyone who can access this app and freezes it in the application.
+- `contracts/ConsentCraft.sol`: consent, ERC-721 escrow, sale, and pull-payment accounting.
+- `contract-tests/consentcraft.mjs`: adversarial contract tests on a real local EVM.
+- `scripts/compile-contracts.mjs`, `scripts/deploy.mjs`: compiler, generated ABI, and network-checked deployment.
+- `lib/contracts/server.ts`: immutable package preparation and confirmed-chain reconciliation.
+- `lib/contracts/storage.ts`: canonical serialization, content-addressed files, and Pinata integration.
+- `components/chain-controls.tsx`: wallet review, transaction lifecycle, purchase, earnings, and network screens.
+- `app/api/studio/route.ts`: account authentication, private drafts, invites, and revision checks.
+- `tests/web3-integration.mjs`: five-wallet, end-to-end acceptance flow.
 
-## Code map
-
-- `app/api/studio/route.ts`: authenticated API, invitation lifecycle, review and publication rules.
-- `lib/store.ts`: local persistence, accounts, sessions, and transaction serialization.
-- `components/consent-app.tsx`: studio, library, editor, reader, and account interfaces.
-- `components/web3-provider.tsx`, `lib/wagmi.ts`: wallet and query providers.
-- `app/design.css`, `app/features.css`, `app/responsive.css`: visual system and layouts.
-- `lib/images.ts`: image validation, decoding, size limits, and metadata removal.
-- `tests/integration.mjs`: isolated multi-user and wallet authentication integration checks.
-
-## Specification decisions
-
-User corrections supersede the attached specification: teams are dynamic, each published comic has a dedicated page, and the visual direction is neobrutalism. To deliver a self-contained working prototype without external credentials, this iteration uses local persistence and account approvals. Supabase, IPFS, and onchain approvals/payments remain separate integration work. Plain CSS replaces the scaffold's custom Tailwind compiler loader, which failed during the production build on this Windows environment.
+The contract constrains its own minting and sale path. It does not establish authorship, prevent copying or minting elsewhere, or automatically transfer copyright. It is not independently audited; this build targets local Ethereum and Sepolia test ETH.

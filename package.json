@@ -2,24 +2,33 @@
   "name": "consentcraft",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "node ./node_modules/next/dist/bin/next dev",
-    "build": "node ./node_modules/next/dist/bin/next build",
+    "build": "node scripts/build.mjs",
     "start": "node ./node_modules/next/dist/bin/next start",
     "lint": "node ./node_modules/eslint/bin/eslint.js",
     "typecheck": "node ./node_modules/typescript/lib/tsc.js --noEmit",
-    "test": "node tests/integration.mjs"
+    "test": "node tests/integration.mjs",
+    "test:web3": "node tests/web3-integration.mjs",
+    "contracts:compile": "node scripts/compile-contracts.mjs",
+    "contracts:test": "node contract-tests/consentcraft.mjs",
+    "chain": "node scripts/local-chain.mjs",
+    "deploy:local": "node scripts/deploy.mjs local",
+    "deploy:sepolia": "node scripts/deploy.mjs sepolia"
   },
   "dependencies": {
     "@rainbow-me/rainbowkit": "^2.2.11",
     "@tanstack/react-query": "^5.105.3",
+    "ethers": "6.17.0",
     "next": "16.4.5",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "sharp": "0.35.5",
     "siwe": "^3.0.0",
     "viem": "^2.57.16",
-    "wagmi": "^2.19.5"
+    "wagmi": "^2.19.5",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@openzeppelin/contracts": "5.6.1",

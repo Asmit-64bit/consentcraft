@@ -3,6 +3,8 @@ import { generateNonce, SiweMessage } from "siwe";
 import { getAddress } from "viem";
 import { AppError, database, ensure, event, hash, id, passwordMatches, publicUser, sessionUser, text } from "@/lib/store";
 import { validateImage } from "@/lib/images";
+import { chainClient, prepareReview, reconcileProject } from "@/lib/contracts/server";
+import { consentCraftAbi } from "@/lib/contracts/abi";
 import type { Panel, Project } from "@/lib/types";
 
 const headers = { "Cache-Control": "no-store" };
@@ -10,7 +12,7 @@ function errorResponse(error: unknown) { if (!(error instanceof AppError)) conso
 export async function GET(req: NextRequest) {
   try {
     const isNonce = req.nextUrl.searchParams.get("action") === "nonce";
-    return await database(db => {
+    return await database(async db => {
       if (isNonce) {
         const nonce = generateNonce();
         if (!db.nonces) db.nonces = [];
@@ -24,13 +26,19 @@ export async function GET(req: NextRequest) {
         ensure(user && db.projects.some(p => p.id === invitedProject && p.ownerId === user.id), "Project not found.", 404);
         return NextResponse.json({ invitations: db.invitations.filter(i => i.projectId === invitedProject && !i.accepted && Date.parse(i.expiresAt) > Date.now()) }, { headers });
       }
+      const visibleProjects = db.projects.filter(p => p.state === "published" || (user && p.members.some(m => m.userId === user.id)));
+      for (const p of visibleProjects) {
+        if (!p.review) continue;
+        try { await reconcileProject(p); } catch (error) { p.chainError = error instanceof AppError ? error.message : "Could not reconcile Ethereum state. Check the RPC and refresh before continuing."; }
+      }
+      const dto = (p: Project) => ({ ...p, members: p.state === "published" ? p.members : p.members.map(m => ({ ...m, address: db.users.find(u => u.id === m.userId)?.address })) });
       const invitations = user ? db.invitations.flatMap(i => {
         if (i.accepted || Date.parse(i.expiresAt) <= Date.now() || (i.email !== user.email && i.email !== user.address?.toLowerCase())) return [];
         const project = db.projects.find(p => p.id === i.projectId && !p.rosterFrozen);
         return project ? [{ ...i, projectTitle: project.title, ownerName: project.members.find(m => m.userId === project.ownerId)?.name || "Project owner" }] : [];
       }) : [];
-      return NextResponse.json({ user: user ? publicUser(user) : null, projects: user ? db.projects.filter(p => p.members.some(m => m.userId === user.id)) : [], comics: db.projects.filter(p => p.state === "published").map(p => ({ ...p, events: [] })), invitations }, { headers });
-    }, isNonce);
+      return NextResponse.json({ user: user ? publicUser(user) : null, projects: user ? db.projects.filter(p => p.members.some(m => m.userId === user.id)).map(dto) : [], comics: db.projects.filter(p => p.state === "published" && p.review?.status === "minted" && !p.chainError).map(p => ({ ...dto(p), events: [], reviewHistory: undefined })), invitations }, { headers });
+    }, true);
   } catch (error) { return errorResponse(error); }
 }
 
@@ -133,6 +141,7 @@ export async function POST(req: NextRequest) {
         const invitation = { id: id() + id(), projectId: p.id, email: target, expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), accepted: false }; db.invitations.push(invitation); event(p, `${user.name} created a team invitation.`); return NextResponse.json({ token: invitation.id }, { headers });
       }
       ensure(b.revision === p.revision, "This project changed in another session. Reload the latest version before continuing.", 409);
+      if (action === "approve" || action === "revoke" || action === "publish") throw new AppError("Consent and minting require a transaction from your connected wallet. Server-only approvals are disabled.", 403);
       if (action === "save") {
         ensure(p.state === "draft", "Start a new revision before editing this review.", 409);
         ensure(Array.isArray(b.panels) && b.panels.length === 4, "A comic needs four panel slots.");
@@ -146,19 +155,25 @@ export async function POST(req: NextRequest) {
         p.panels = panels;
         if (owner) {
           p.title = text(b.title, 80, "Title"); p.description = text(b.description, 1000, "Description", false); p.terms = text(b.terms, 3000, "Use terms");
+          const price = text(b.priceWei ?? p.priceWei ?? "0", 78, "Price in wei"); ensure(/^\d+$/.test(price) && BigInt(price) < 2n ** 256n, "Price must be an unsigned integer in wei."); p.priceWei = price;
           ensure(Array.isArray(b.members) && b.members.length === p.members.length, "The team has changed. Reload first.", 409);
           p.members = p.members.map(m => { const candidate = (b.members as Record<string, unknown>[]).find(c => c.userId === m.userId); ensure(candidate && Number.isInteger(candidate.share) && Number(candidate.share) >= 0 && Number(candidate.share) <= 10000, "Shares must be between 0 and 100% with up to two decimal places."); return { ...m, role: text(candidate.role, 60, "Role"), share: Number(candidate.share) }; });
         }
         event(p, `${user.name} saved the comic.`);
       } else if (action === "review") {
         ensure(owner && p.state === "draft", "Only the owner can start a review from a draft.", 403);
-        ensure(!db.invitations.some(i => i.projectId === p.id && !i.accepted && Date.parse(i.expiresAt) > Date.now()), "Your team has pending invitations. Wait for everyone to join before freezing the roster.");
-        ensure(p.panels.every(panel => panel.image && panel.alt), "Add artwork and an image description to all four panels.");
-        ensure(p.members.every(m => m.share > 0) && p.members.reduce((s, m) => s + m.share, 0) === 10000, "Give every contributor a positive share, totaling exactly 100%.");
-        p.state = "review"; p.rosterFrozen = true; p.version++; p.approvals = []; event(p, `${user.name} froze version ${p.version} for everyone's review.`);
-      } else if (action === "revise") { ensure(owner && p.state === "review", "Only the owner can reopen a review.", 403); p.state = "draft"; p.approvals = []; event(p, `${user.name} reopened the draft. Earlier approvals were cleared.`);
-      } else if (action === "approve" || action === "revoke") { ensure(p.state === "review", "This comic isn't awaiting review.", 409); p.approvals = p.approvals.filter(u => u !== user.id); if (action === "approve") p.approvals.push(user.id); event(p, `${user.name} ${action === "approve" ? "approved" : "revoked approval for"} version ${p.version}.`);
-      } else if (action === "publish") { ensure(owner && p.state === "review" && p.members.every(m => p.approvals.includes(m.userId)), "Every contributor must approve this version before the owner can publish.", 403); p.state = "published"; p.publishedAt = new Date().toISOString(); event(p, `${user.name} published this comic with everyone's approval.`);
+        ensure(user.address, "Connect and sign in with the owner's wallet before review.", 403);
+        ensure(b.publicationConsent === true, "Confirm that this review package will be publicly accessible.");
+        await prepareReview(db, p, process.env.NEXT_PUBLIC_APP_URL || origin!);
+      } else if (action === "revise") {
+        ensure(owner && p.state === "review", "Only the owner can reopen a review.", 403);
+        if (p.review) {
+          await reconcileProject(p);
+          const current = await chainClient.readContract({ address: p.review.contract, abi: consentCraftAbi, functionName: "getProject", args: [p.review.projectKey] });
+          ensure(!current.minted, "This comic was already minted and cannot be edited.", 409);
+          ensure(!p.chainTransactions?.some(t => t.status === "submitted"), "Wait for pending transactions before reopening the draft.", 409);
+        }
+        p.state = "draft"; event(p, `${user.name} reopened the draft. A new onchain proposal is required to supersede the current version.`);
       } else throw new AppError("Unknown action.");
       p.revision++; return NextResponse.json({ ok: true, id: p.id }, { headers });
     }, true);

@@ -6,7 +6,8 @@ import type { User, Project, Invitation } from "./types";
 
 export type Account = User & { password?: string; salt?: string };
 export type Database = { users: Account[]; sessions: { token: string; userId: string; expires: number }[]; projects: Project[]; invitations: Invitation[]; nonces?: { nonce: string; expires: number }[]; schemaVersion?: number; archivedDemoProjects?: Project[] };
-const root = path.join(process.cwd(), ".data", process.env.CONSENTCRAFT_DATA_NAMESPACE || "studio");
+export const storageRoot = path.join(process.cwd(), ".data", process.env.CONSENTCRAFT_DATA_NAMESPACE || "studio");
+const root = storageRoot;
 const file = path.join(root, "studio.json");
 const globalStore = globalThis as typeof globalThis & { consentLock?: Promise<unknown> };
 export async function database<T>(fn: (db: Database) => T | Promise<T>, write = false): Promise<T> {
