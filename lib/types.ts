@@ -1,4 +1,4 @@
-export type User = { id: string; name: string; email: string; color: string };
+export type User = { id: string; name: string; email: string; color: string; address?: string };
 export type Member = { userId: string; name: string; role: string; share: number };
 export type Panel = { image: string; dialogue: string; alt: string };
 export type Project = {
@@ -9,4 +9,5 @@ export type Project = {
   events: { id: string; text: string; at: string }[]; sample?: boolean;
 };
 export type Invitation = { id: string; projectId: string; email: string; expiresAt: string; accepted: boolean };
-export type AppData = { user: User | null; projects: Project[]; comics: Project[] };
+export type IncomingInvitation = Invitation & { projectTitle: string; ownerName: string };
+export type AppData = { user: User | null; projects: Project[]; comics: Project[]; invitations: IncomingInvitation[] };

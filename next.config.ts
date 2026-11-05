@@ -5,6 +5,11 @@ const nextConfig: NextConfig = {
   experimental: {
     agentFeedback: true,
   },
+  turbopack: {
+    resolveAlias: {
+      "@base-org/account": "@base-org/account/browser",
+    },
+  },
   // This prototype uses plain CSS. No custom CSS loader is necessary.
   devIndicators: false,
 };

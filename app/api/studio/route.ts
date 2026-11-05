@@ -1,20 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
+import { generateNonce, SiweMessage } from "siwe";
+import { getAddress } from "viem";
 import { AppError, database, ensure, event, hash, id, passwordMatches, publicUser, sessionUser, text } from "@/lib/store";
-import { templates, samplePanels } from "@/lib/demo";
+import { validateImage } from "@/lib/images";
 import type { Panel, Project } from "@/lib/types";
 
 const headers = { "Cache-Control": "no-store" };
 function errorResponse(error: unknown) { if (!(error instanceof AppError)) console.error("Studio request failed", error); return NextResponse.json({ error: error instanceof AppError ? error.message : "Something went wrong. Please try again." }, { status: error instanceof AppError ? error.status : 500, headers }); }
 export async function GET(req: NextRequest) {
-  try { return await database(db => {
-    const user = sessionUser(db, req.cookies.get("cc_session")?.value);
-    const invitedProject = req.nextUrl.searchParams.get("invitations");
-    if (invitedProject) {
-      ensure(user && db.projects.some(p => p.id === invitedProject && p.ownerId === user.id), "Project not found.", 404);
-      return NextResponse.json({ invitations: db.invitations.filter(i => i.projectId === invitedProject && !i.accepted && Date.parse(i.expiresAt) > Date.now()) }, { headers });
-    }
-    return NextResponse.json({ user: user ? publicUser(user) : null, projects: user ? db.projects.filter(p => p.members.some(m => m.userId === user.id)) : [], comics: db.projects.filter(p => p.state === "published").map(p => ({ ...p, events: [] })) }, { headers });
-  }); } catch (error) { return errorResponse(error); }
+  try {
+    const isNonce = req.nextUrl.searchParams.get("action") === "nonce";
+    return await database(db => {
+      if (isNonce) {
+        const nonce = generateNonce();
+        if (!db.nonces) db.nonces = [];
+        db.nonces = db.nonces.filter(n => n.expires > Date.now());
+        db.nonces.push({ nonce, expires: Date.now() + 10 * 60 * 1000 });
+        return NextResponse.json({ nonce }, { headers });
+      }
+      const user = sessionUser(db, req.cookies.get("cc_session")?.value);
+      const invitedProject = req.nextUrl.searchParams.get("invitations");
+      if (invitedProject) {
+        ensure(user && db.projects.some(p => p.id === invitedProject && p.ownerId === user.id), "Project not found.", 404);
+        return NextResponse.json({ invitations: db.invitations.filter(i => i.projectId === invitedProject && !i.accepted && Date.parse(i.expiresAt) > Date.now()) }, { headers });
+      }
+      const invitations = user ? db.invitations.flatMap(i => {
+        if (i.accepted || Date.parse(i.expiresAt) <= Date.now() || (i.email !== user.email && i.email !== user.address?.toLowerCase())) return [];
+        const project = db.projects.find(p => p.id === i.projectId && !p.rosterFrozen);
+        return project ? [{ ...i, projectTitle: project.title, ownerName: project.members.find(m => m.userId === project.ownerId)?.name || "Project owner" }] : [];
+      }) : [];
+      return NextResponse.json({ user: user ? publicUser(user) : null, projects: user ? db.projects.filter(p => p.members.some(m => m.userId === user.id)) : [], comics: db.projects.filter(p => p.state === "published").map(p => ({ ...p, events: [] })), invitations }, { headers });
+    }, isNonce);
+  } catch (error) { return errorResponse(error); }
 }
 
 export async function POST(req: NextRequest) {
@@ -29,11 +46,51 @@ export async function POST(req: NextRequest) {
     return await database(async db => {
       const action = b.action; const token = req.cookies.get("cc_session")?.value;
       let user = sessionUser(db, token);
-      if (action === "signup" || action === "login" || action === "demo") {
-        if (action === "demo") {
-          const uid = id(); user = { id: uid, name: "Alex", email: `demo-${uid}@local.invalid`, color: "purple", salt: id(), password: "" };
-          user.password = hash(id(), user.salt); db.users.push(user);
-          templates.forEach((t, index) => { const p = newProject(user!.id, user!.name, t.title, t.description, t.theme); p.genre = t.genre; p.panels = samplePanels(t.theme, t.lines); if (index === 1) { p.panels[2] = { image: "", dialogue: "", alt: "" }; p.panels[3] = { image: "", dialogue: "", alt: "" }; } db.projects.push(p); });
+      if (action === "nonce") {
+        const nonce = generateNonce();
+        if (!db.nonces) db.nonces = [];
+        db.nonces = db.nonces.filter(n => n.expires > Date.now());
+        db.nonces.push({ nonce, expires: Date.now() + 10 * 60 * 1000 });
+        return NextResponse.json({ nonce }, { headers });
+      }
+      if (action === "signup" || action === "login" || action === "siwe") {
+        if (action === "siwe") {
+          const rawMessage = text(b.message, 5000, "SIWE message");
+          const signature = text(b.signature, 500, "Signature");
+          let siwe: SiweMessage;
+          try { siwe = new SiweMessage(rawMessage); } catch { throw new AppError("Invalid wallet sign-in message.", 401); }
+          ensure(siwe.domain === host && siwe.uri === origin, "This signature was requested by a different site.", 401);
+          if (!db.nonces) db.nonces = [];
+          const nonceIndex = db.nonces.findIndex(n => n.nonce === siwe.nonce && n.expires > Date.now());
+          ensure(nonceIndex !== -1, "Invalid or expired sign-in request. Please try again.", 401);
+          db.nonces.splice(nonceIndex, 1);
+          const verifyResult = await siwe.verify({ signature, domain: host, nonce: siwe.nonce }, { suppressExceptions: true });
+          ensure(verifyResult.success, "Invalid wallet signature.", 401);
+          const checksummedAddress = getAddress(verifyResult.data.address);
+          if (user && !user.address) {
+            const existing = db.users.find(u => u.address?.toLowerCase() === checksummedAddress.toLowerCase() && u.id !== user!.id);
+            if (!existing) {
+              user.address = checksummedAddress;
+            } else {
+              user = existing;
+            }
+          } else {
+            let account = db.users.find(u => u.address?.toLowerCase() === checksummedAddress.toLowerCase());
+            if (!account) {
+              const short = `${checksummedAddress.slice(0, 6)}…${checksummedAddress.slice(-4)}`;
+              account = {
+                id: id(),
+                name: short,
+                email: `${checksummedAddress.toLowerCase()}@wallet.invalid`,
+                color: "purple",
+                address: checksummedAddress,
+                salt: id(),
+                password: "",
+              };
+              db.users.push(account);
+            }
+            user = account;
+          }
         } else {
           const email = text(b.email, 254, "Email").toLowerCase(); ensure(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email), "Enter a valid email address.");
           const password = text(b.password, 128, "Password"); ensure(password.length >= 8, "Use at least 8 characters for your password.");
@@ -43,14 +100,14 @@ export async function POST(req: NextRequest) {
           } else { const account = db.users.find(u => u.email === email); ensure(account && passwordMatches(password, account), "Email or password is incorrect.", 401); user = account; }
         }
         const newToken = id() + id(); db.sessions = db.sessions.filter(s => s.expires > Date.now() && s.token !== token); db.sessions.push({ token: newToken, userId: user.id, expires: Date.now() + 7 * 86400000 });
-        const res = NextResponse.json({ ok: true }, { headers }); res.cookies.set("cc_session", newToken, { httpOnly: true, sameSite: "strict", secure: req.nextUrl.protocol === "https:", path: "/", maxAge: 7 * 86400 }); return res;
+        const res = NextResponse.json({ ok: true, user: publicUser(user) }, { headers }); res.cookies.set("cc_session", newToken, { httpOnly: true, sameSite: "strict", secure: req.nextUrl.protocol === "https:", path: "/", maxAge: 7 * 86400 }); return res;
       }
       if (action === "logout") { db.sessions = db.sessions.filter(s => s.token !== token); const res = NextResponse.json({ ok: true }, { headers }); res.cookies.delete("cc_session"); return res; }
       ensure(user, "Sign in to use your studio.", 401);
-      if (action === "create") { const p = newProject(user.id, user.name, text(b.title, 80, "Title"), text(b.description ?? "", 1000, "Description", false), ["space", "ramen", "garden"].includes(String(b.theme)) ? String(b.theme) : "space"); db.projects.push(p); return NextResponse.json({ id: p.id }, { headers }); }
+      if (action === "create") { const p = newProject(user.id, user.name, text(b.title, 80, "Title"), text(b.description ?? "", 1000, "Description", false), text(b.genre ?? "Original comic", 60, "Genre")); db.projects.push(p); return NextResponse.json({ id: p.id }, { headers }); }
       if (action === "accept") {
         const invite = db.invitations.find(i => i.id === b.token); ensure(invite && !invite.accepted && Date.parse(invite.expiresAt) > Date.now(), "This invitation has expired or was already used.", 404);
-        ensure(invite.email === user.email, "Sign in with the email address this invitation was sent to.", 403);
+        ensure(invite.email === user.email || (user.address && invite.email.toLowerCase() === user.address.toLowerCase()), "Sign in with the email address or wallet this invitation was sent to.", 403);
         const p = db.projects.find(p => p.id === invite.projectId); ensure(p && !p.rosterFrozen, "This team is already frozen for review.", 409);
         ensure(!p.members.some(m => m.userId === user.id), "You're already on this team.", 409);
         p.members.push({ userId: user.id, name: user.name, role: "Collaborator", share: 0 }); p.revision++; invite.accepted = true; event(p, `${user.name} joined the team.`); return NextResponse.json({ id: p.id }, { headers });
@@ -66,14 +123,26 @@ export async function POST(req: NextRequest) {
       }
       if (action === "invite") {
         ensure(owner && !p.rosterFrozen, "Only the owner can invite people before the first review.", 403);
-        const email = text(b.email, 254, "Email").toLowerCase(); ensure(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email), "Enter a valid email address."); ensure(!p.members.some(m => db.users.find(u => u.id === m.userId)?.email === email), "This person is already on the team.");
-        const invitation = { id: id() + id(), projectId: p.id, email, expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), accepted: false }; db.invitations.push(invitation); event(p, `${user.name} created a team invitation.`); return NextResponse.json({ token: invitation.id }, { headers });
+        const target = text(b.email, 254, "Email or address").toLowerCase();
+        ensure(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(target) || /^0x[a-f0-9]{40}$/.test(target), "Enter a valid email or Ethereum address.");
+        ensure(!p.members.some(m => {
+          const u = db.users.find(u => u.id === m.userId);
+          return u?.email === target || (u?.address && u.address.toLowerCase() === target);
+        }), "This person is already on the team.");
+        ensure(!db.invitations.some(i => i.projectId === p.id && i.email === target && !i.accepted && Date.parse(i.expiresAt) > Date.now()), "There is already a pending invitation for this person. Copy its link below.", 409);
+        const invitation = { id: id() + id(), projectId: p.id, email: target, expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), accepted: false }; db.invitations.push(invitation); event(p, `${user.name} created a team invitation.`); return NextResponse.json({ token: invitation.id }, { headers });
       }
       ensure(b.revision === p.revision, "This project changed in another session. Reload the latest version before continuing.", 409);
       if (action === "save") {
         ensure(p.state === "draft", "Start a new revision before editing this review.", 409);
         ensure(Array.isArray(b.panels) && b.panels.length === 4, "A comic needs four panel slots.");
-        const panels: Panel[] = b.panels.map((raw) => { ensure(raw && typeof raw === "object", "Invalid panel."); const panel = raw as Record<string, unknown>; const image = text(panel.image, 3_500_000, "Panel image", false); ensure(!image || /^\/art\/(space|ramen|garden)\.svg(#panel-[0-3])?$/.test(image) || /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(image), "Use a valid PNG or JPEG image."); if (image.startsWith("data:")) { const bytes = Buffer.from(image.split(",")[1], "base64"); ensure((bytes[0] === 0xff && bytes[1] === 0xd8) || (bytes[0] === 0x89 && bytes.subarray(1, 4).toString() === "PNG"), "Invalid image file."); } return { image, dialogue: text(panel.dialogue, 2000, "Dialogue", false), alt: text(panel.alt, 500, "Image description", false) }; });
+        const panels: Panel[] = [];
+        for (const raw of b.panels) {
+          ensure(raw && typeof raw === "object", "Invalid panel.");
+          const panel = raw as Record<string, unknown>;
+          const image = await validateImage(panel.image);
+          panels.push({ image, dialogue: text(panel.dialogue, 2000, "Dialogue", false), alt: text(panel.alt, 500, "Image description", false) });
+        }
         p.panels = panels;
         if (owner) {
           p.title = text(b.title, 80, "Title"); p.description = text(b.description, 1000, "Description", false); p.terms = text(b.terms, 3000, "Use terms");
@@ -95,6 +164,6 @@ export async function POST(req: NextRequest) {
     }, true);
   } catch (error) { return errorResponse(error); }
 }
-function newProject(ownerId: string, name: string, title: string, description: string, theme: string): Project {
-  const now = new Date().toISOString(); return { id: id(), ownerId, title, description, theme, genre: "Original comic", members: [{ userId: ownerId, name, role: "Creator", share: 10000 }], panels: Array.from({ length: 4 }, () => ({ image: "", dialogue: "", alt: "" })), state: "draft", revision: 1, version: 0, approvals: [], terms: "Personal reading and sharing a link are welcome. Artwork belongs to its creators. Commercial reuse requires permission from all contributors.", rosterFrozen: false, createdAt: now, updatedAt: now, events: [{ id: id(), text: `${name} started a new story.`, at: now }] };
+function newProject(ownerId: string, name: string, title: string, description: string, genre: string): Project {
+  const now = new Date().toISOString(); return { id: id(), ownerId, title, description, theme: "", genre, members: [{ userId: ownerId, name, role: "Creator", share: 10000 }], panels: Array.from({ length: 4 }, () => ({ image: "", dialogue: "", alt: "" })), state: "draft", revision: 1, version: 0, approvals: [], terms: "Personal reading and sharing a link are welcome. Artwork belongs to its creators. Commercial reuse requires permission from all contributors.", rosterFrozen: false, createdAt: now, updatedAt: now, events: [{ id: id(), text: `${name} started a new story.`, at: now }] };
 }

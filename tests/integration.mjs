@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import sharp from "sharp";
 import path from "node:path";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { SiweMessage } from "siwe";
 
 // Each run uses its own local data namespace; it never modifies a user's studio.
 const namespace = `test-${randomUUID()}`;
@@ -32,11 +35,20 @@ function client() {
 try {
   await start();
   const accounts = Array.from({ length: 4 }, () => client()); const outsider = client();
+  const emptyStudio = (await outsider.get()).body;
+  assert.deepEqual(emptyStudio, { user: null, projects: [], comics: [], invitations: [] });
+  await outsider.post({ action: "demo" }, 401);
   for (let i = 0; i < accounts.length; i++) await accounts[i].post({ action: "signup", name: `Creator ${i + 1}`, email: `creator${i}@example.test`, password: "prototype-test-password" });
   const owner = accounts[0];
-  const { id } = await owner.post({ action: "create", title: "Four voices, one story", description: "Integration test comic", theme: "space" });
+  const { id } = await owner.post({ action: "create", title: "Four voices, one story", description: "Integration test comic", genre: "Adventure" });
   const getProject = async (who = owner) => (await who.get()).body.projects.find(p => p.id === id);
   const mutate = async (who, action, extra = {}, expected = 200) => { const p = await getProject(who); return who.post({ action, id, revision: p.revision, ...extra }, expected); };
+  assert.equal((await getProject()).genre, "Adventure");
+  assert.ok((await getProject()).panels.every(p => !p.image && !p.dialogue && !p.alt));
+  assert.equal((await owner.get()).body.projects.length, 1);
+  assert.equal((await accounts[1].get()).body.projects.length, 0);
+  await mutate(owner, "review", {}, 400);
+  console.log("PASS empty account workspaces, no sample content, saved genre, and incomplete draft gate");
   assert.equal((await outsider.get()).body.projects.length, 0);
   await outsider.post({ action: "save", id }, 401);
   await accounts[1].post({ action: "approve", id, revision: 1 }, 404);
@@ -46,8 +58,13 @@ try {
 
   for (let i = 1; i < accounts.length; i++) {
     const invite = await owner.post({ action: "invite", id, email: `creator${i}@example.test` });
+    await owner.post({ action: "invite", id, email: `creator${i}@example.test` }, 409);
+    const inbox = (await accounts[i].get()).body.invitations;
+    assert.equal(inbox.length, 1); assert.equal(inbox[0].projectTitle, "Four voices, one story");
+    assert.equal((await outsider.get()).body.invitations.length, 0);
     if (i === 1) await accounts[2].post({ action: "accept", token: invite.token }, 403);
     await accounts[i].post({ action: "accept", token: invite.token });
+    assert.equal((await accounts[i].get()).body.invitations.length, 0);
     await accounts[i].post({ action: "accept", token: invite.token }, 404);
   }
   assert.equal((await getProject()).members.length, 4);
@@ -57,8 +74,20 @@ try {
   console.log("PASS dynamic four-person team, email-bound single-use invitations, cancellation");
 
   let p = await getProject(); const oldRevision = p.revision;
-  const payload = { title: p.title, description: p.description, terms: p.terms, members: p.members.map(m => ({ ...m, share: 2500 })), panels: Array.from({ length: 4 }, (_, i) => ({ image: `/art/space.svg#panel-${i}`, dialogue: `Panel ${i + 1}`, alt: `An astronaut, scene ${i + 1}` })) };
+  const png = await sharp({ create: { width: 16, height: 12, channels: 3, background: "#c6b3ed" } }).png().toBuffer();
+  const image = `data:image/png;base64,${png.toString("base64")}`;
+  const payload = { title: p.title, description: p.description, terms: p.terms, members: p.members.map(m => ({ ...m, share: 2500 })), panels: Array.from({ length: 4 }, (_, i) => ({ image, dialogue: i ? `Panel ${i + 1}` : "", alt: `Uploaded illustration, scene ${i + 1}` })) };
+  for (const invalid of ["/art/space.svg", "data:image/png;base64,iVBORw0KGgo=", `data:image/jpeg;base64,${png.toString("base64")}`]) {
+    await mutate(owner, "save", { ...payload, panels: payload.panels.map((p, i) => i ? p : { ...p, image: invalid }) }, 400);
+  }
+  assert.equal((await getProject()).revision, oldRevision);
   await mutate(owner, "save", payload);
+  const uploaded = (await getProject()).panels[0];
+  assert.ok(uploaded.image.startsWith("data:image/jpeg;base64,"));
+  assert.equal(uploaded.dialogue, "");
+  const decoded = await sharp(Buffer.from(uploaded.image.split(",")[1], "base64")).metadata();
+  assert.equal(decoded.width, 16); assert.equal(decoded.height, 12);
+  console.log("PASS uploaded images decode correctly, invalid images reject atomically, and captions stay optional");
   await owner.post({ action: "save", id, revision: oldRevision, ...payload }, 409);
   await mutate(accounts[1], "review", {}, 403);
   const beforeConcurrent = await getProject();
@@ -97,5 +126,86 @@ try {
   await owner.post({ action: "login", email: "creator0@example.test", password: "prototype-test-password" });
   assert.equal((await getProject()).members.length, 4);
   console.log("PASS server restart persistence, password hashing, sign-out, and sign-in");
+
+  // Web3 / RainbowKit SIWE authentication tests
+  const walletAccount = privateKeyToAccount(generatePrivateKey());
+  const walletClient = client();
+
+  // 1. Fetch nonce
+  const nonceRes = await walletClient.get("?action=nonce");
+  assert.ok(nonceRes.body.nonce && typeof nonceRes.body.nonce === "string");
+  const nonce = nonceRes.body.nonce;
+
+  // 2. Prepare SIWE message
+  const siweMsg = new SiweMessage({
+    domain: "127.0.0.1:3017",
+    address: walletAccount.address,
+    statement: "Sign in with Ethereum to ConsentCraft.",
+    uri: "http://127.0.0.1:3017",
+    version: "1",
+    chainId: 1,
+    nonce,
+  }).prepareMessage();
+
+  // 3. Sign message with wallet
+  const signature = await walletAccount.signMessage({ message: siweMsg });
+
+  // Signatures from another site, wrong signers, and malformed messages must fail.
+  const foreignMessage = new SiweMessage({ domain: "unrelated.example", address: walletAccount.address, uri: "https://unrelated.example", version: "1", chainId: 1, nonce }).prepareMessage();
+  await walletClient.post({ action: "siwe", message: foreignMessage, signature: await walletAccount.signMessage({ message: foreignMessage }) }, 401);
+  const wrongSigner = privateKeyToAccount(generatePrivateKey());
+  await walletClient.post({ action: "siwe", message: siweMsg, signature: await wrongSigner.signMessage({ message: siweMsg }) }, 401);
+  await walletClient.post({ action: "siwe", message: "not a SIWE message", signature }, 401);
+
+  // 4. Authenticate via SIWE
+  const siweAuth = await walletClient.post({ action: "siwe", message: siweMsg, signature });
+  assert.equal(siweAuth.ok, true);
+  assert.equal(siweAuth.user.address.toLowerCase(), walletAccount.address.toLowerCase());
+
+  // 5. Replay attack rejection (nonce already consumed)
+  await walletClient.post({ action: "siwe", message: siweMsg, signature }, 401);
+
+  // 6. Verified studio state for wallet user
+  const studioState = await walletClient.get();
+  assert.equal(studioState.body.user.address.toLowerCase(), walletAccount.address.toLowerCase());
+
+  // 7. Wallet user can create a project
+  const walletProject = await walletClient.post({ action: "create", title: "Web3 Story", description: "Created with RainbowKit wallet", theme: "ramen" });
+  assert.ok(walletProject.id);
+
+  // Wallet invitations must work for both address casing and inbox visibility.
+  const walletInviteProject = await owner.post({ action: "create", title: "Wallet collaboration" });
+  const walletInvite = await owner.post({ action: "invite", id: walletInviteProject.id, email: walletAccount.address });
+  assert.equal((await walletClient.get()).body.invitations[0].id, walletInvite.token);
+  await walletClient.post({ action: "accept", token: walletInvite.token });
+  assert.equal((await walletClient.get()).body.projects.find(p => p.id === walletInviteProject.id).members.length, 2);
+  console.log("PASS wallet-address invitation inbox and acceptance");
+
+  // 8. Sign out wallet user
+  await walletClient.post({ action: "logout" });
+  assert.equal((await walletClient.get()).body.user, null);
+  console.log("PASS RainbowKit SIWE nonce generation, wallet signature auth, replay rejection, and session management");
+
+  // Upgrade an old database in isolation. Archive demo content without deleting user work.
+  await stop();
+  const dataFile = path.join(process.cwd(), ".data", namespace, "studio.json");
+  const legacy = JSON.parse(await readFile(dataFile, "utf8"));
+  delete legacy.schemaVersion;
+  legacy.users.push({ id: "legacy-demo", name: "Alex", email: "demo-old@local.invalid", color: "purple" });
+  legacy.sessions.push({ token: "legacy-session", userId: "legacy-demo", expires: Date.now() + 60000 });
+  legacy.projects.push({ ...legacy.projects[0], id: "sample-old", sample: true });
+  legacy.projects.push({ ...legacy.projects[0], id: "demo-old", ownerId: "legacy-demo" });
+  await writeFile(dataFile, JSON.stringify(legacy));
+  await start();
+  const migrated = (await owner.get()).body;
+  assert.ok(migrated.projects.some(p => p.id === id));
+  assert.ok(migrated.comics.every(p => !p.sample && p.ownerId !== "legacy-demo"));
+  const archive = JSON.parse(await readFile(dataFile, "utf8"));
+  assert.equal(archive.archivedDemoProjects.length, 2);
+  assert.ok(archive.sessions.every(s => s.userId !== "legacy-demo"));
+  await owner.get();
+  assert.equal(JSON.parse(await readFile(dataFile, "utf8")).archivedDemoProjects.length, 2);
+  console.log("PASS non-destructive, idempotent demo archive and normal account preservation");
+
   console.log("All integration checks passed. Isolated test namespace: " + namespace);
 } catch (error) { console.error(output); throw error; } finally { await stop(); }
